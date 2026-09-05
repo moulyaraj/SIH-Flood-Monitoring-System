@@ -1,0 +1,487 @@
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduTFLite.h>
+#include "model_data.h"
+
+// ============================================================
+// FLOOD EDGE AI - ESP32
+// ============================================================
+
+// -------------------- PIN CONFIGURATION --------------------
+
+// JSN-SR04T
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+// DS18B20
+#define ONE_WIRE_PIN 4
+
+// Rain gauge
+#define RAIN_PIN 27
+
+// Buzzer
+#define BUZZER_PIN 25
+
+// MPU6050 uses I2C
+// SDA = GPIO 21
+// SCL = GPIO 22
+
+// -------------------- WATER LEVEL --------------------
+
+// Distance from ultrasonic sensor to the reference water level
+// CHANGE THIS to your actual installation height.
+#define SENSOR_HEIGHT_CM 100.0
+
+// -------------------- RAIN GAUGE --------------------
+
+// CHANGE this according to your rain gauge calibration.
+// Example: if one bucket tip = 0.2 mm, use 0.2.
+#define RAIN_MM_PER_TIP 0.2
+
+// -------------------- AI TENSOR ARENA --------------------
+
+#define TENSOR_ARENA_SIZE 20000
+
+byte tensorArena[TENSOR_ARENA_SIZE];
+
+// -------------------- SENSORS --------------------
+
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature temperatureSensor(&oneWire);
+
+// -------------------- MPU6050 --------------------
+
+#define MPU6050_ADDR 0x68
+
+float accelX = 0;
+float accelY = 0;
+float accelZ = 0;
+
+float tiltDeg = 0;
+float vibrationRms = 0;
+
+// -------------------- RAIN --------------------
+
+volatile unsigned long rainTips = 0;
+
+unsigned long previousRainTime = 0;
+unsigned long rainTipsAtStart = 0;
+
+float rainRate = 0;
+
+// -------------------- WATER LEVEL --------------------
+
+float waterLevel = 0;
+float previousWaterLevel = 0;
+
+unsigned long previousWaterTime = 0;
+
+float riseRate = 0;
+
+// -------------------- TEMPERATURE --------------------
+
+float temperatureC = 0;
+
+// ============================================================
+// MPU6050 FUNCTIONS
+// ============================================================
+
+void writeMPU6050(byte reg, byte value)
+{
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+void setupMPU6050()
+{
+  Wire.begin();
+
+  // Wake MPU6050
+  writeMPU6050(0x6B, 0x00);
+
+  // Accelerometer ±2g
+  writeMPU6050(0x1C, 0x00);
+
+  delay(100);
+}
+
+void readMPU6050()
+{
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MPU6050_ADDR, 6);
+
+  if (Wire.available() >= 6)
+  {
+    int16_t rawX = Wire.read() << 8 | Wire.read();
+    int16_t rawY = Wire.read() << 8 | Wire.read();
+    int16_t rawZ = Wire.read() << 8 | Wire.read();
+
+    accelX = rawX / 16384.0;
+    accelY = rawY / 16384.0;
+    accelZ = rawZ / 16384.0;
+
+    // Calculate tilt from gravity
+    tiltDeg = atan2(
+      sqrt(accelX * accelX + accelY * accelY),
+      accelZ
+    ) * 180.0 / PI;
+  }
+}
+
+// Calculate vibration RMS over a short sampling window
+void calculateVibration()
+{
+  const int samples = 50;
+
+  float sumSquares = 0;
+
+  for (int i = 0; i < samples; i++)
+  {
+    readMPU6050();
+
+    float magnitude =
+      sqrt(
+        accelX * accelX +
+        accelY * accelY +
+        accelZ * accelZ
+      );
+
+    // Difference from normal gravity
+    float vibration = magnitude - 1.0;
+
+    sumSquares += vibration * vibration;
+
+    delay(10);
+  }
+
+  vibrationRms = sqrt(sumSquares / samples);
+}
+
+// ============================================================
+// JSN-SR04T
+// ============================================================
+
+float readWaterLevel()
+{
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0)
+  {
+    return waterLevel;
+  }
+
+  float distanceCm = duration * 0.0343 / 2.0;
+
+  float level = SENSOR_HEIGHT_CM - distanceCm;
+
+  if (level < 0)
+    level = 0;
+
+  return level;
+}
+
+// ============================================================
+// RAIN GAUGE
+// ============================================================
+
+void rainInterrupt()
+{
+  rainTips++;
+}
+
+void calculateRainRate()
+{
+  unsigned long currentTime = millis();
+
+  if (currentTime - previousRainTime >= 60000)
+  {
+    unsigned long tipsNow = rainTips;
+
+    unsigned long tipsDuringPeriod =
+      tipsNow - rainTipsAtStart;
+
+    float rainMm =
+      tipsDuringPeriod * RAIN_MM_PER_TIP;
+
+    // Since measurement period is one minute:
+    // mm/min × 60 = mm/hour
+    rainRate = rainMm * 60.0;
+
+    rainTipsAtStart = tipsNow;
+    previousRainTime = currentTime;
+  }
+}
+
+// ============================================================
+// TEMPERATURE
+// ============================================================
+
+void readTemperature()
+{
+  temperatureSensor.requestTemperatures();
+
+  float temp = temperatureSensor.getTempCByIndex(0);
+
+  if (temp != DEVICE_DISCONNECTED_C)
+  {
+    temperatureC = temp;
+  }
+}
+
+// ============================================================
+// RISE RATE
+// ============================================================
+
+void calculateRiseRate()
+{
+  unsigned long currentTime = millis();
+
+  if (currentTime - previousWaterTime >= 60000)
+  {
+    float change =
+      waterLevel - previousWaterLevel;
+
+    // One-minute measurement period
+    riseRate = change;
+
+    previousWaterLevel = waterLevel;
+    previousWaterTime = currentTime;
+  }
+}
+
+// ============================================================
+// AI NORMALIZATION
+// ============================================================
+
+float normalize(
+  float value,
+  float mean,
+  float standardDeviation
+)
+{
+  return (value - mean) / standardDeviation;
+}
+
+// ============================================================
+// RUN FLOOD AI
+// ============================================================
+
+void runFloodAI()
+{
+  // Exact values used during training
+  float input0 = normalize(
+    waterLevel,
+    37.2578973,
+    14.9102356
+  );
+
+  float input1 = normalize(
+    riseRate,
+    0.5777166,
+    0.5382420
+  );
+
+  float input2 = normalize(
+    rainRate,
+    21.3656590,
+    15.4541621
+  );
+
+  float input3 = normalize(
+    vibrationRms,
+    0.0362907,
+    0.0229748
+  );
+
+  float input4 = normalize(
+    tiltDeg,
+    1.6662518,
+    1.3293828
+  );
+
+  float input5 = normalize(
+    temperatureC,
+    26.9400554,
+    4.9690032
+  );
+
+  // Send six inputs to the AI model
+  modelSetInput(input0, 0);
+  modelSetInput(input1, 1);
+  modelSetInput(input2, 2);
+  modelSetInput(input3, 3);
+  modelSetInput(input4, 4);
+  modelSetInput(input5, 5);
+
+  // Run inference
+  bool success = modelRunInference();
+
+  if (!success)
+  {
+    Serial.println("AI inference FAILED!");
+    return;
+  }
+
+  // Sigmoid output: approximately 0 to 1
+  float prediction = modelGetOutput(0);
+
+  Serial.println();
+  Serial.println("========== FLOOD AI ==========");
+
+  Serial.print("Water level: ");
+  Serial.print(waterLevel);
+  Serial.println(" cm");
+
+  Serial.print("Rise rate: ");
+  Serial.print(riseRate);
+  Serial.println(" cm/min");
+
+  Serial.print("Rain rate: ");
+  Serial.print(rainRate);
+  Serial.println(" mm/hour");
+
+  Serial.print("Vibration RMS: ");
+  Serial.print(vibrationRms);
+  Serial.println(" g");
+
+  Serial.print("Tilt: ");
+  Serial.print(tiltDeg);
+  Serial.println(" deg");
+
+  Serial.print("Temperature: ");
+  Serial.print(temperatureC);
+  Serial.println(" C");
+
+  Serial.print("AI score: ");
+  Serial.println(prediction, 4);
+
+  // Flood decision
+  if (prediction >= 0.5)
+  {
+    Serial.println("!!! FLOOD ALERT !!!");
+
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
+  else
+  {
+    Serial.println("STATUS: NORMAL");
+
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  Serial.println("==============================");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("     FLOOD EDGE AI - ESP32");
+  Serial.println("================================");
+
+  // Pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(RAIN_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Temperature sensor
+  temperatureSensor.begin();
+
+  // MPU6050
+  setupMPU6050();
+
+  // Rain interrupt
+  attachInterrupt(
+    digitalPinToInterrupt(RAIN_PIN),
+    rainInterrupt,
+    FALLING
+  );
+
+  // Initialize timers
+  previousRainTime = millis();
+  previousWaterTime = millis();
+
+  rainTipsAtStart = rainTips;
+
+  // Initialize water level
+  waterLevel = readWaterLevel();
+  previousWaterLevel = waterLevel;
+
+  // Initialize temperature
+  readTemperature();
+
+  Serial.println("Sensors initialized.");
+
+  // Initialize AI model
+  Serial.println("Initializing AI model...");
+
+  if (!modelInit(
+        flood_model,
+        tensorArena,
+        TENSOR_ARENA_SIZE
+      ))
+  {
+    Serial.println("ERROR: AI MODEL INITIALIZATION FAILED!");
+
+    while (1)
+    {
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(200);
+    }
+  }
+
+  Serial.println("AI model initialized successfully!");
+
+  Serial.println("System ready.");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+  // Read sensors
+  waterLevel = readWaterLevel();
+
+  calculateRiseRate();
+
+  calculateRainRate();
+
+  readTemperature();
+
+  calculateVibration();
+
+  // Run AI
+  runFloodAI();
+
+  // Wait before next reading
+  delay(5000);
+}
