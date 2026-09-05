@@ -63,6 +63,7 @@ Our prototype is cost-effective, modular, and built using readily available hard
 ---
 
 ## ⚙️ System Architecture Workflow
+```text
 [Sensor Inputs: Ultrasonic, Rain, Temperature, MPU6050, ESP32-CAM]
                                         │
                                         ▼
@@ -98,21 +99,25 @@ Our prototype is cost-effective, modular, and built using readily available hard
                                  [Python Flask Server & Dashboard]
                                  (GIS Mapping & Emergency Alerts)
 
+```
+
 🔍Quick Breakdown of the Flow Logic
 **Normal State Branch (YES):** 
 When the sensor readings are within safe baseline parameters, the ESP32 logs the telemetry locally to an onboard SD card for record-keeping without wasting transmission bandwidth.  
 **Anomalous State Branch (NO):** 
 If local Edge AI detects a threshold breach (such as rising water levels or seismic vibration), the node packages the incident, compresses the GPS and metadata, and immediately transmits a long-range packet via LoRa to bypass failed network infrastructure. 
                                  
+```markdown
 ## ⚡ Repository Structure
+```text
 SIH-Flood-Monitoring-System/
 ├── public/
 │   └── index.html       # Minimalist dark-mode real-time dashboard UI
 ├── src/
 │   └── main.cpp         # ESP32 C++ firmware for sensor nodes & gateway
 ├── server.py            # Python Flask backend & serial communication handler
-└── README.md            # Comprehensive project documentation
-
+└── README.md
+```
 ---
 ## 👥 Team Members
 * **Team EcoSentry** (Team ID: `BMS/SIH2026/48`)
